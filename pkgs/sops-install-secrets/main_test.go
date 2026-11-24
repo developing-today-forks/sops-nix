@@ -351,3 +351,59 @@ func TestIsValidFormat(t *testing.T) {
 		generateCase(strings.ToUpper(format), false)
 	}
 }
+
+func TestRecurseSecretKeyNested(t *testing.T) {
+	// JSON decodes nested objects as map[string]interface{}.
+	jsonKeys := map[string]interface{}{
+		"top": "top-value",
+		"outer": map[string]interface{}{
+			"inner": "nested-value",
+			"deep": map[string]interface{}{
+				"leaf": "deep-value",
+			},
+		},
+	}
+
+	val, err := recurseSecretKey(JSON, jsonKeys, "top")
+	ok(t, err)
+	equals(t, "top-value", val)
+
+	val, err = recurseSecretKey(JSON, jsonKeys, "outer/inner")
+	ok(t, err)
+	equals(t, "nested-value", val)
+
+	val, err = recurseSecretKey(JSON, jsonKeys, "outer/deep/leaf")
+	ok(t, err)
+	equals(t, "deep-value", val)
+
+	// A non-string JSON leaf is marshalled back to JSON.
+	val, err = recurseSecretKey(JSON, jsonKeys, "outer/deep")
+	ok(t, err)
+	equals(t, `{"leaf":"deep-value"}`, val)
+
+	if _, err := recurseSecretKey(JSON, jsonKeys, "outer/missing"); err == nil {
+		t.Error("expected error for missing nested key, got nil")
+	}
+	if _, err := recurseSecretKey(JSON, jsonKeys, "top/inner"); err == nil {
+		t.Error("expected error for non-dictionary intermediate key, got nil")
+	}
+
+	// YAML decodes nested maps as map[interface{}]interface{}.
+	yamlKeys := map[string]interface{}{
+		"outer": map[interface{}]interface{}{
+			"inner": "yaml-nested-value",
+		},
+	}
+
+	val, err = recurseSecretKey(Yaml, yamlKeys, "outer/inner")
+	ok(t, err)
+	equals(t, "yaml-nested-value", val)
+
+	// Each format only accepts its own nesting type.
+	if _, err := recurseSecretKey(Yaml, jsonKeys, "outer/inner"); err == nil {
+		t.Error("expected error for JSON-style nesting under YAML format, got nil")
+	}
+	if _, err := recurseSecretKey(JSON, yamlKeys, "outer/inner"); err == nil {
+		t.Error("expected error for YAML-style nesting under JSON format, got nil")
+	}
+}
