@@ -8,9 +8,11 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"os/exec"
 	"os/user"
 	"path"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"syscall"
@@ -29,8 +31,10 @@ type secret struct {
 	Name         string     `json:"name"`
 	Key          string     `json:"key"`
 	Path         string     `json:"path"`
-	Owner        string     `json:"owner"`
-	Group        string     `json:"group"`
+	Owner        *string    `json:"owner,omitempty"`
+	UID          int        `json:"uid"`
+	Group        *string    `json:"group,omitempty"`
+	GID          int        `json:"gid"`
 	SopsFile     string     `json:"sopsFile"`
 	Format       FormatType `json:"format"`
 	Mode         string     `json:"mode"`
@@ -47,18 +51,41 @@ type loggingConfig struct {
 	SecretChanges bool `json:"secretChanges"`
 }
 
+type template struct {
+	Name         string   `json:"name"`
+	Content      string   `json:"content"`
+	Path         string   `json:"path"`
+	Mode         string   `json:"mode"`
+	Owner        *string  `json:"owner,omitempty"`
+	UID          int      `json:"uid"`
+	Group        *string  `json:"group,omitempty"`
+	GID          int      `json:"gid"`
+	File         string   `json:"file"`
+	RestartUnits []string `json:"restartUnits"`
+	ReloadUnits  []string `json:"reloadUnits"`
+	value        []byte
+	mode         os.FileMode
+	content      string
+	owner        int
+	group        int
+}
+
 type manifest struct {
-	Secrets           []secret      `json:"secrets"`
-	SecretsMountPoint string        `json:"secretsMountPoint"`
-	SymlinkPath       string        `json:"symlinkPath"`
-	KeepGenerations   int           `json:"keepGenerations"`
-	SSHKeyPaths       []string      `json:"sshKeyPaths"`
-	GnupgHome         string        `json:"gnupgHome"`
-	AgeKeyFile        string        `json:"ageKeyFile"`
-	AgeSSHKeyPaths    []string      `json:"ageSshKeyPaths"`
-	UseTmpfs          bool          `json:"useTmpfs"`
-	UserMode          bool          `json:"userMode"`
-	Logging           loggingConfig `json:"logging"`
+	Secrets                 []secret          `json:"secrets"`
+	Templates               []template        `json:"templates"`
+	PlaceholderBySecretName map[string]string `json:"placeholderBySecretName"`
+	SecretsMountPoint       string            `json:"secretsMountPoint"`
+	SymlinkPath             string            `json:"symlinkPath"`
+	KeepGenerations         int               `json:"keepGenerations"`
+	SSHKeyPaths             []string          `json:"sshKeyPaths"`
+	GnupgHome               string            `json:"gnupgHome"`
+	AgeKeyFile              string            `json:"ageKeyFile"`
+	AgeSSHKeyFile           string            `json:"ageSshKeyFile"`
+	AgeSSHKeyCmd            string            `json:"ageSshKeyCmd"`
+	AgeSSHKeyPaths          []string          `json:"ageSshKeyPaths"`
+	UseTmpfs                bool              `json:"useTmpfs"`
+	UserMode                bool              `json:"userMode"`
+	Logging                 loggingConfig     `json:"logging"`
 }
 
 type secretFile struct {
@@ -126,18 +153,22 @@ type options struct {
 }
 
 type appContext struct {
-	manifest     manifest
-	secretFiles  map[string]secretFile
-	checkMode    CheckMode
-	ignorePasswd bool
+	manifest            manifest
+	secretFiles         map[string]secretFile
+	secretByPlaceholder map[string]*secret
+	checkMode           CheckMode
+	ignorePasswd        bool
 }
+
+// Keep this in sync with `modules/sops/templates/default.nix`
+const RenderedSubdir string = "rendered"
 
 func readManifest(path string) (*manifest, error) {
 	file, err := os.Open(path)
 	if err != nil {
 		return nil, fmt.Errorf("failed to open manifest: %w", err)
 	}
-	defer file.Close()
+	defer func() { _ = file.Close() }()
 	dec := json.NewDecoder(file)
 	var m manifest
 	if err := dec.Decode(&m); err != nil {
@@ -146,51 +177,84 @@ func readManifest(path string) (*manifest, error) {
 	return &m, nil
 }
 
-func linksAreEqual(linkTarget, targetFile string, info os.FileInfo, secret *secret) bool {
+func linksAreEqual(linkTarget, targetFile string, info os.FileInfo, owner int, group int) bool {
 	validUG := true
 	if stat, ok := info.Sys().(*syscall.Stat_t); ok {
-		validUG = validUG && int(stat.Uid) == secret.owner
-		validUG = validUG && int(stat.Gid) == secret.group
+		validUG = validUG && int(stat.Uid) == owner
+		validUG = validUG && int(stat.Gid) == group
 	} else {
 		panic("Failed to cast fileInfo Sys() to *syscall.Stat_t. This is possibly an unsupported OS.")
 	}
 	return linkTarget == targetFile && validUG
 }
 
-func symlinkSecret(targetFile string, secret *secret, userMode bool) error {
+func SecureSymlinkChown(targetFile string, path string, owner int, group int) error {
+	// Create a temp directory to house the symlink while we change it's
+	// ownership. `os.MkdirTemp` creates a directory with the permissions 0700.
+	// The temp dir is created in the same parent directory of the final
+	// symlink, because the later `os.Rename` operation won't work across disk
+	// devices.
+	dir, err := os.MkdirTemp(filepath.Dir(path), "")
+	if err != nil {
+		return fmt.Errorf("cannot create temporary symlink directory: %w", err)
+	}
+	defer func() { _ = os.RemoveAll(dir) }()
+
+	// Create symlink to `targetFile` in the temp dir, before chowning it.
+	tmpSymlink := filepath.Join(dir, filepath.Base(path))
+	if err = os.Symlink(targetFile, tmpSymlink); err != nil {
+		return fmt.Errorf(
+			"cannot create symlink '%s' (pointing to '%s'): %w", path, targetFile, err)
+	}
+
+	err = os.Lchown(tmpSymlink, owner, group)
+	if err != nil {
+		return fmt.Errorf(
+			"cannot change owner of symlink '%s' (pointing to '%s') to owner/group: %d/%d: %w",
+			tmpSymlink, targetFile, owner, group, err)
+	}
+
+	// Move the chowned symlink to it's final location.
+	err = os.Rename(tmpSymlink, path)
+	if err != nil {
+		return fmt.Errorf("cannot move symlink '%s' to '%s': %w", tmpSymlink, path, err)
+	}
+	return nil
+}
+
+func createSymlink(targetFile string, path string, owner int, group int, userMode bool) error {
 	for {
-		stat, err := os.Lstat(secret.Path)
+		stat, err := os.Lstat(path)
 		if os.IsNotExist(err) {
-			if err = os.Symlink(targetFile, secret.Path); err != nil {
-				return fmt.Errorf("cannot create symlink '%s': %w", secret.Path, err)
-			}
 			if !userMode {
-				if err = SecureSymlinkChown(secret.Path, targetFile, secret.owner, secret.group); err != nil {
-					return fmt.Errorf("cannot chown symlink '%s': %w", secret.Path, err)
+				if err = SecureSymlinkChown(targetFile, path, owner, group); err != nil {
+					return fmt.Errorf("cannot chown symlink '%s': %w", path, err)
 				}
+			} else if err = os.Symlink(targetFile, path); err != nil {
+				return fmt.Errorf("cannot create symlink '%s': %w", path, err)
 			}
 			return nil
 		} else if err != nil {
-			return fmt.Errorf("cannot stat '%s': %w", secret.Path, err)
+			return fmt.Errorf("cannot stat '%s': %w", path, err)
 		}
 		if stat.Mode()&os.ModeSymlink == os.ModeSymlink {
-			linkTarget, err := os.Readlink(secret.Path)
+			linkTarget, err := os.Readlink(path)
 			if os.IsNotExist(err) {
 				continue
 			} else if err != nil {
-				return fmt.Errorf("cannot read symlink '%s': %w", secret.Path, err)
-			} else if linksAreEqual(linkTarget, targetFile, stat, secret) {
+				return fmt.Errorf("cannot read symlink '%s': %w", path, err)
+			} else if linksAreEqual(linkTarget, targetFile, stat, owner, group) {
 				return nil
 			}
 		}
-		if err := os.Remove(secret.Path); err != nil {
-			return fmt.Errorf("cannot override %s: %w", secret.Path, err)
+		if err := os.Remove(path); err != nil {
+			return fmt.Errorf("cannot override %s: %w", path, err)
 		}
 	}
 }
 
-func symlinkSecrets(targetDir string, secrets []secret, userMode bool) error {
-	for i, secret := range secrets {
+func symlinkSecretsAndTemplates(targetDir string, secrets []secret, templates []template, userMode bool) error {
+	for _, secret := range secrets {
 		targetFile := filepath.Join(targetDir, secret.Name)
 		if targetFile == secret.Path {
 			continue
@@ -199,10 +263,25 @@ func symlinkSecrets(targetDir string, secrets []secret, userMode bool) error {
 		if err := os.MkdirAll(parent, os.ModePerm); err != nil {
 			return fmt.Errorf("cannot create parent directory of '%s': %w", secret.Path, err)
 		}
-		if err := symlinkSecret(targetFile, &secrets[i], userMode); err != nil {
+		if err := createSymlink(targetFile, secret.Path, secret.owner, secret.group, userMode); err != nil {
 			return fmt.Errorf("failed to symlink secret '%s': %w", secret.Path, err)
 		}
 	}
+
+	for _, template := range templates {
+		targetFile := filepath.Join(targetDir, RenderedSubdir, template.Name)
+		if targetFile == template.Path {
+			continue
+		}
+		parent := filepath.Dir(template.Path)
+		if err := os.MkdirAll(parent, os.ModePerm); err != nil {
+			return fmt.Errorf("cannot create parent directory of '%s': %w", template.Path, err)
+		}
+		if err := createSymlink(targetFile, template.Path, template.owner, template.group, userMode); err != nil {
+			return fmt.Errorf("failed to symlink template '%s': %w", template.Path, err)
+		}
+	}
+
 	return nil
 }
 
@@ -229,6 +308,10 @@ func recurseSecretKey(format FormatType, keys map[string]interface{}, wantedKey 
 				}
 				return "", fmt.Errorf("the key '%s%s' cannot be found", keyUntilNow, currentKey)
 			}
+			if keyUntilNow != "" {
+				keyUntilNow += "/"
+			}
+			keyUntilNow += currentKey
 			break
 		}
 		thisKey := currentKey[:slashIndex]
@@ -294,12 +377,20 @@ func decryptSecret(s *secret, sourceFiles map[string]plainData) error {
 		case Binary, Dotenv, Ini:
 			sourceFile.binary = plain
 		case Yaml:
-			if err := yaml.Unmarshal(plain, &sourceFile.data); err != nil {
-				return fmt.Errorf("cannot parse yaml of '%s': %w", s.SopsFile, err)
+			if s.Key == "" {
+				sourceFile.binary = plain
+			} else {
+				if err := yaml.Unmarshal(plain, &sourceFile.data); err != nil {
+					return fmt.Errorf("cannot parse yaml of '%s': %w", s.SopsFile, err)
+				}
 			}
 		case JSON:
-			if err := json.Unmarshal(plain, &sourceFile.data); err != nil {
-				return fmt.Errorf("cannot parse json of '%s': %w", s.SopsFile, err)
+			if s.Key == "" {
+				sourceFile.binary = plain
+			} else {
+				if err := json.Unmarshal(plain, &sourceFile.data); err != nil {
+					return fmt.Errorf("cannot parse json of '%s': %w", s.SopsFile, err)
+				}
 			}
 		default:
 			return fmt.Errorf("secret of type %s in %s is not supported", s.Format, s.SopsFile)
@@ -309,11 +400,15 @@ func decryptSecret(s *secret, sourceFiles map[string]plainData) error {
 	case Binary, Dotenv, Ini:
 		s.value = sourceFile.binary
 	case Yaml, JSON:
-		strVal, err := recurseSecretKey(s.Format, sourceFile.data, s.Key)
-		if err != nil {
-			return fmt.Errorf("secret %s in %s is not valid: %w", s.Name, s.SopsFile, err)
+		if s.Key == "" {
+			s.value = sourceFile.binary
+		} else {
+			strVal, err := recurseSecretKey(s.Format, sourceFile.data, s.Key)
+			if err != nil {
+				return fmt.Errorf("secret %s in %s is not valid: %w", s.Name, s.SopsFile, err)
+			}
+			s.value = []byte(strVal)
 		}
-		s.value = []byte(strVal)
 	}
 	sourceFiles[s.SopsFile] = sourceFile
 	return nil
@@ -346,7 +441,13 @@ func prepareSecretsDir(secretMountpoint string, linkName string, keysGID int, us
 			}
 		}
 	} else if !os.IsNotExist(err) {
-		return nil, fmt.Errorf("cannot access %s: %w", linkName, err)
+		if _, err2 := os.Lstat(linkName); err2 != nil {
+			return nil, fmt.Errorf("cannot access %s: %w", linkName, err)
+		}
+		// if `/run/secrets` exists, but is not a symlink, we need to remove it
+		if err = os.RemoveAll(linkName); err != nil {
+			return nil, fmt.Errorf("cannot remove %s: %w", linkName, err)
+		}
 	}
 	generation++
 	dir := filepath.Join(secretMountpoint, strconv.Itoa(int(generation)))
@@ -366,24 +467,30 @@ func prepareSecretsDir(secretMountpoint string, linkName string, keysGID int, us
 	return &dir, nil
 }
 
+func createParentDirs(parent string, target string, keysGID int, userMode bool) error {
+	dirs := strings.Split(filepath.Dir(target), "/")
+	pathSoFar := parent
+	for _, dir := range dirs {
+		pathSoFar = filepath.Join(pathSoFar, dir)
+		if err := os.MkdirAll(pathSoFar, 0o751); err != nil {
+			return fmt.Errorf("cannot create directory '%s' for %s: %w", pathSoFar, filepath.Join(parent, target), err)
+		}
+		if !userMode {
+			if err := os.Chown(pathSoFar, 0, int(keysGID)); err != nil {
+				return fmt.Errorf("cannot own directory '%s' for %s: %w", pathSoFar, filepath.Join(parent, target), err)
+			}
+		}
+	}
+	return nil
+}
+
 func writeSecrets(secretDir string, secrets []secret, keysGID int, userMode bool) error {
 	for _, secret := range secrets {
 		fp := filepath.Join(secretDir, secret.Name)
 
-		dirs := strings.Split(filepath.Dir(secret.Name), "/")
-		pathSoFar := secretDir
-		for _, dir := range dirs {
-			pathSoFar = filepath.Join(pathSoFar, dir)
-			if err := os.MkdirAll(pathSoFar, 0o751); err != nil {
-				return fmt.Errorf("cannot create directory '%s' for %s: %w", pathSoFar, fp, err)
-			}
-			if !userMode {
-				if err := os.Chown(pathSoFar, 0, int(keysGID)); err != nil {
-					return fmt.Errorf("cannot own directory '%s' for %s: %w", pathSoFar, fp, err)
-				}
-			}
+		if err := createParentDirs(secretDir, secret.Name, keysGID, userMode); err != nil {
+			return err
 		}
-
 		if err := os.WriteFile(fp, []byte(secret.value), secret.mode); err != nil {
 			return fmt.Errorf("cannot write %s: %w", fp, err)
 		}
@@ -460,7 +567,7 @@ func (app *appContext) loadSopsFile(s *secret) (*secretFile, error) {
 		if err != nil {
 			return nil, fmt.Errorf("cannot parse ini of '%s': %w", s.SopsFile, err)
 		}
-		// TODO: we do not acctually check the contents of the ini here...
+		// TODO: we do not actually check the contents of the ini here...
 	}
 
 	return &secretFile{
@@ -476,7 +583,7 @@ func (app *appContext) validateSopsFile(s *secret, file *secretFile) error {
 			s.Name, s.SopsFile, s.Format,
 			file.firstSecret.Format, file.firstSecret.Name)
 	}
-	if app.checkMode != Manifest && (s.Format != Binary && s.Format != Dotenv && s.Format != Ini) {
+	if app.checkMode != Manifest && (s.Format != Binary && s.Format != Dotenv && s.Format != Ini) && s.Key != "" {
 		_, err := recurseSecretKey(s.Format, file.keys, s.Key)
 		if err != nil {
 			return fmt.Errorf("secret %s in %s is not valid: %w", s.Name, s.SopsFile, err)
@@ -485,37 +592,68 @@ func (app *appContext) validateSopsFile(s *secret, file *secretFile) error {
 	return nil
 }
 
-func (app *appContext) validateSecret(secret *secret) error {
-	mode, err := strconv.ParseUint(secret.Mode, 8, 16)
+func validateMode(mode string) (os.FileMode, error) {
+	parsed, err := strconv.ParseUint(mode, 8, 16)
 	if err != nil {
-		return fmt.Errorf("invalid number in mode: %d: %w", mode, err)
+		return 0, fmt.Errorf("invalid number in mode: %s: %w", mode, err)
 	}
-	secret.mode = os.FileMode(mode)
+	return os.FileMode(parsed), nil
+}
+
+func validateOwner(owner string) (int, error) {
+	lookedUp, err := user.Lookup(owner)
+	if err != nil {
+		return 0, fmt.Errorf("failed to lookup user '%s': %w", owner, err)
+	}
+	ownerNr, err := strconv.ParseUint(lookedUp.Uid, 10, 64)
+	if err != nil {
+		return 0, fmt.Errorf("cannot parse uid %s: %w", lookedUp.Uid, err)
+	}
+	return int(ownerNr), nil
+}
+
+func validateGroup(group string) (int, error) {
+	lookedUp, err := user.LookupGroup(group)
+	if err != nil {
+		return 0, fmt.Errorf("failed to lookup group '%s': %w", group, err)
+	}
+	groupNr, err := strconv.ParseUint(lookedUp.Gid, 10, 64)
+	if err != nil {
+		return 0, fmt.Errorf("cannot parse gid %s: %w", lookedUp.Gid, err)
+	}
+	return int(groupNr), nil
+}
+
+func (app *appContext) validateSecret(secret *secret) error {
+	mode, err := validateMode(secret.Mode)
+	if err != nil {
+		return err
+	}
+	secret.mode = mode
 
 	if app.ignorePasswd || os.Getenv("NIXOS_ACTION") == "dry-activate" {
 		secret.owner = 0
 		secret.group = 0
 	} else if app.checkMode == Off || app.ignorePasswd {
-		// we only access to the user/group during deployment
-		owner, err := user.Lookup(secret.Owner)
-		if err != nil {
-			return fmt.Errorf("failed to lookup user '%s': %w", secret.Owner, err)
+		if secret.Owner == nil {
+			secret.owner = secret.UID
+		} else {
+			owner, err := validateOwner(*secret.Owner)
+			if err != nil {
+				return err
+			}
+			secret.owner = owner
 		}
-		ownerNr, err := strconv.ParseUint(owner.Uid, 10, 64)
-		if err != nil {
-			return fmt.Errorf("cannot parse uid %s: %w", owner.Uid, err)
-		}
-		secret.owner = int(ownerNr)
 
-		group, err := user.LookupGroup(secret.Group)
-		if err != nil {
-			return fmt.Errorf("failed to lookup group '%s': %w", secret.Group, err)
+		if secret.Group == nil {
+			secret.group = secret.GID
+		} else {
+			group, err := validateGroup(*secret.Group)
+			if err != nil {
+				return err
+			}
+			secret.group = group
 		}
-		groupNr, err := strconv.ParseUint(group.Gid, 10, 64)
-		if err != nil {
-			return fmt.Errorf("cannot parse gid %s: %w", group.Gid, err)
-		}
-		secret.group = int(groupNr)
 	}
 
 	if secret.Format == "" {
@@ -533,10 +671,77 @@ func (app *appContext) validateSecret(secret *secret) error {
 			return err
 		}
 		app.secretFiles[secret.SopsFile] = *maybeFile
+
 		file = *maybeFile
 	}
 
 	return app.validateSopsFile(secret, &file)
+}
+
+func renderTemplates(templates []template, secretByPlaceholder map[string]*secret) {
+	for i := range templates {
+		template := &templates[i]
+		rendered := renderTemplate(&template.content, secretByPlaceholder)
+		template.value = []byte(rendered)
+	}
+}
+
+func renderTemplate(content *string, secretByPlaceholder map[string]*secret) string {
+	rendered := *content
+	for placeholder, secret := range secretByPlaceholder {
+		rendered = strings.ReplaceAll(rendered, placeholder, string(secret.value))
+	}
+	return rendered
+}
+
+func (app *appContext) validateTemplate(template *template) error {
+	mode, err := validateMode(template.Mode)
+	if err != nil {
+		return err
+	}
+	template.mode = mode
+
+	if app.ignorePasswd || os.Getenv("NIXOS_ACTION") == "dry-activate" {
+		template.owner = 0
+		template.group = 0
+	} else if app.checkMode == Off || app.ignorePasswd {
+		if template.Owner == nil {
+			template.owner = template.UID
+		} else {
+			owner, err := validateOwner(*template.Owner)
+			if err != nil {
+				return err
+			}
+			template.owner = owner
+		}
+
+		if template.Group == nil {
+			template.group = template.GID
+		} else {
+			group, err := validateGroup(*template.Group)
+			if err != nil {
+				return err
+			}
+			template.group = group
+		}
+	}
+
+	var templateText string
+	if template.Content != "" {
+		templateText = template.Content
+	} else if template.File != "" {
+		templateBytes, err := os.ReadFile(template.File)
+		if err != nil {
+			return fmt.Errorf("cannot read %s: %w", template.File, err)
+		}
+		templateText = string(templateBytes)
+	} else {
+		return fmt.Errorf("neither content nor file was specified for template %s", template.Name)
+	}
+
+	template.content = templateText
+
+	return nil
 }
 
 func (app *appContext) validateManifest() error {
@@ -553,7 +758,26 @@ func (app *appContext) validateManifest() error {
 	}
 
 	for i := range m.Secrets {
-		if err := app.validateSecret(&m.Secrets[i]); err != nil {
+		secret := &m.Secrets[i]
+		if err := app.validateSecret(secret); err != nil {
+			return err
+		}
+
+		// The Nix module only defines placeholders for secrets if there are
+		// templates.
+		if len(m.Templates) > 0 {
+			placeholder, present := m.PlaceholderBySecretName[secret.Name]
+			if !present {
+				return fmt.Errorf("placeholder for %s not found in manifest", secret.Name)
+			}
+
+			app.secretByPlaceholder[placeholder] = secret
+		}
+	}
+
+	for i := range m.Templates {
+		template := &m.Templates[i]
+		if err := app.validateTemplate(template); err != nil {
 			return err
 		}
 	}
@@ -562,7 +786,7 @@ func (app *appContext) validateManifest() error {
 
 func atomicSymlink(oldname, newname string) error {
 	if err := os.MkdirAll(filepath.Dir(newname), 0o755); err != nil {
-		return err
+		return fmt.Errorf("cannot create directory %s: %w", filepath.Dir(newname), err)
 	}
 
 	// Fast path: if newname does not exist yet, we can skip the whole dance
@@ -575,26 +799,22 @@ func atomicSymlink(oldname, newname string) error {
 	// and removing+symlinking creates a TOCTOU race.
 	d, err := os.MkdirTemp(filepath.Dir(newname), "."+filepath.Base(newname))
 	if err != nil {
-		return err
+		return fmt.Errorf("cannot create temporary directory: %w", err)
 	}
-	cleanup := true
 	defer func() {
-		if cleanup {
-			os.RemoveAll(d)
-		}
+		_ = os.RemoveAll(d)
 	}()
 
 	symlink := filepath.Join(d, "tmp.symlink")
 	if err := os.Symlink(oldname, symlink); err != nil {
-		return err
+		return fmt.Errorf("cannot create symlink %s: %w", symlink, err)
 	}
 
 	if err := os.Rename(symlink, newname); err != nil {
-		return err
+		return fmt.Errorf("cannot rename %s to %s: %w", symlink, newname, err)
 	}
 
-	cleanup = false
-	return os.RemoveAll(d)
+	return nil
 }
 
 func pruneGenerations(secretsMountPoint, secretsDir string, keepGenerations int) error {
@@ -613,7 +833,7 @@ func pruneGenerations(secretsMountPoint, secretsDir string, keepGenerations int)
 	if err != nil {
 		return fmt.Errorf("cannot open %s: %w", secretsMountPoint, err)
 	}
-	defer file.Close()
+	defer func() { _ = file.Close() }()
 
 	generations, err := file.Readdirnames(0)
 	if err != nil {
@@ -631,7 +851,10 @@ func pruneGenerations(secretsMountPoint, secretsDir string, keepGenerations int)
 			continue
 		}
 		if currentGeneration-keepGenerations >= generationNum {
-			os.RemoveAll(path.Join(secretsMountPoint, generationName))
+			err = os.RemoveAll(path.Join(secretsMountPoint, generationName))
+			if err != nil {
+				return err
+			}
 		}
 	}
 
@@ -646,13 +869,17 @@ func importSSHKeys(logcfg loggingConfig, keyPaths []string, gpgHome string) erro
 	if err != nil {
 		return fmt.Errorf("cannot create %s: %w", secringPath, err)
 	}
-	defer secring.Close()
+	defer func() {
+		_ = secring.Close()
+	}()
 
 	pubring, err := os.OpenFile(pubringPath, os.O_WRONLY|os.O_CREATE, 0o600)
 	if err != nil {
 		return fmt.Errorf("cannot create %s: %w", pubringPath, err)
 	}
-	defer pubring.Close()
+	defer func() {
+		_ = pubring.Close()
+	}()
 
 	for _, p := range keyPaths {
 		sshKey, err := os.ReadFile(p)
@@ -684,7 +911,7 @@ func importSSHKeys(logcfg loggingConfig, keyPaths []string, gpgHome string) erro
 	return nil
 }
 
-func importAgeSSHKeys(logcfg loggingConfig, keyPaths []string, ageFile os.File) error {
+func importAgeSSHKeys(logcfg loggingConfig, keyPaths []string, ageFile os.File) {
 	for _, p := range keyPaths {
 		// Read the key
 		sshKey, err := os.ReadFile(p)
@@ -710,8 +937,6 @@ func importAgeSSHKeys(logcfg loggingConfig, keyPaths []string, ageFile os.File) 
 			continue
 		}
 	}
-
-	return nil
 }
 
 // Like filepath.Walk but symlink-aware.
@@ -743,13 +968,17 @@ func symlinkWalk(filename string, linkDirname string, walkFn filepath.WalkFunc) 
 	return filepath.Walk(filename, symWalkFunc)
 }
 
-func handleModifications(isDry bool, logcfg loggingConfig, symlinkPath string, secretDir string, secrets []secret) error {
+func handleModifications(isDry bool, logcfg loggingConfig, symlinkPath string, secretDir string, secrets []secret, templates []template) error {
 	var restart []string
 	var reload []string
 
 	newSecrets := make(map[string]bool)
 	modifiedSecrets := make(map[string]bool)
 	removedSecrets := make(map[string]bool)
+
+	newTemplates := make(map[string]bool)
+	modifiedTemplates := make(map[string]bool)
+	removedTemplates := make(map[string]bool)
 
 	// When the symlink path does not exist yet, we are being run in stage-2-init.sh
 	// where switch-to-configuration is not run so the services would only be restarted
@@ -766,8 +995,8 @@ func handleModifications(isDry bool, logcfg loggingConfig, symlinkPath string, s
 		// Read the old file
 		oldData, err := os.ReadFile(oldPath)
 		if err != nil {
-			if os.IsNotExist(err) {
-				// File did not exist before
+			// File did not exist before or the path changed from a file to a directory or vice versa
+			if os.IsNotExist(err) || errors.Is(err, syscall.ENOTDIR) || errors.Is(err, syscall.EISDIR) {
 				restart = append(restart, secret.RestartUnits...)
 				reload = append(reload, secret.ReloadUnits...)
 				newSecrets[secret.Name] = true
@@ -789,32 +1018,124 @@ func handleModifications(isDry bool, logcfg loggingConfig, symlinkPath string, s
 		}
 	}
 
-	writeLines := func(list []string, file string) error {
-		if len(list) != 0 {
-			f, err := os.OpenFile(file, os.O_APPEND|os.O_WRONLY|os.O_CREATE, 0o600)
-			if err != nil {
+	// Find modified/new templates
+	for _, template := range templates {
+		oldPath := filepath.Join(symlinkPath, RenderedSubdir, template.Name)
+		newPath := filepath.Join(secretDir, RenderedSubdir, template.Name)
+
+		// Read the old file
+		oldData, err := os.ReadFile(oldPath)
+		if err != nil {
+			// File did not exist before or the path changed from a file to a directory or vice versa
+			if os.IsNotExist(err) || errors.Is(err, syscall.ENOTDIR) || errors.Is(err, syscall.EISDIR) {
+				restart = append(restart, template.RestartUnits...)
+				reload = append(reload, template.ReloadUnits...)
+				newTemplates[template.Name] = true
+				continue
+			}
+			return err
+		}
+
+		// Read the new file
+		newData, err := os.ReadFile(newPath)
+		if err != nil {
+			return err
+		}
+
+		if !bytes.Equal(oldData, newData) {
+			restart = append(restart, template.RestartUnits...)
+			reload = append(reload, template.ReloadUnits...)
+			modifiedTemplates[template.Name] = true
+		}
+	}
+
+	// Decide how to propagate restart/reload requests.
+	//
+	// When we run as a systemd service (useSystemdActivation = true), the
+	// unit is ordered Before=sysinit-reactivation.target, which
+	// switch-to-configuration restarts *after* it has already consumed
+	// /run/nixos/activation-{restart,reload}-list. Writing to those files
+	// from here therefore does nothing on the current switch and leaks
+	// into the next one. On top of that, NixOS 26.05 deprecates the
+	// activation-list mechanism entirely.
+	//
+	// The NixOS module sets SOPS_RESTART_UNITS_VIA_SYSTEMCTL=1 on the
+	// systemd unit so we know to call systemctl directly. We cannot rely
+	// on INVOCATION_ID for this: switch-to-configuration is almost always
+	// invoked from a process tree rooted in some unit (sshd, getty,
+	// systemd-run, ...), so the activation script inherits it too. For
+	// the legacy activation-script path, keep writing the list files so
+	// that switch-to-configuration picks them up as before.
+	if os.Getenv("SOPS_RESTART_UNITS_VIA_SYSTEMCTL") == "1" {
+		systemctl := func(verb string, units []string) error {
+			if len(units) == 0 {
+				return nil
+			}
+			// --no-block: we are ordered before sysinit-reactivation.target
+			// with DefaultDependencies=no. Blocking on a normal service
+			// (which has After=sysinit.target) would deadlock the
+			// transaction.
+			args := append([]string{"--no-block", verb}, units...)
+			cmd := exec.Command("systemctl", args...)
+			cmd.Stdout = os.Stderr
+			cmd.Stderr = os.Stderr
+			if err := cmd.Run(); err != nil {
+				return fmt.Errorf("error running 'systemctl %s': %w", strings.Join(args, " "), err)
+			}
+			return nil
+		}
+		if isDry {
+			for _, u := range restart {
+				fmt.Fprintf(os.Stderr, "would restart %s\n", u)
+			}
+			for _, u := range reload {
+				fmt.Fprintf(os.Stderr, "would reload %s\n", u)
+			}
+		} else {
+			// try-restart: only act on units that are already running.
+			// On first activation the unit starts fresh with the new
+			// secret anyway, so a no-op is correct.
+			if err := systemctl("try-restart", restart); err != nil {
 				return err
 			}
-			defer f.Close()
-			for _, unit := range list {
-				if _, err = f.WriteString(unit + "\n"); err != nil {
-					return err
-				}
+			if err := systemctl("try-reload-or-restart", reload); err != nil {
+				return err
 			}
 		}
-		return nil
-	}
-	var dryPrefix string
-	if isDry {
-		dryPrefix = "/run/nixos/dry-activation"
 	} else {
-		dryPrefix = "/run/nixos/activation"
-	}
-	if err := writeLines(restart, dryPrefix+"-restart-list"); err != nil {
-		return err
-	}
-	if err := writeLines(reload, dryPrefix+"-reload-list"); err != nil {
-		return err
+		writeLines := func(list []string, file string) error {
+			if len(list) != 0 {
+				if _, err := os.Stat(filepath.Dir(file)); err != nil {
+					if os.IsNotExist(err) {
+						return nil
+					}
+					return err
+				}
+				f, err := os.OpenFile(file, os.O_APPEND|os.O_WRONLY|os.O_CREATE, 0o600)
+				if err != nil {
+					return err
+				}
+				defer func() { _ = f.Close() }()
+				for _, unit := range list {
+					if _, err = f.WriteString(unit + "\n"); err != nil {
+						return err
+					}
+				}
+			}
+			return nil
+		}
+		var dryPrefix string
+		if isDry {
+			dryPrefix = "/run/nixos/dry-activation"
+		} else {
+			dryPrefix = "/run/nixos/activation"
+		}
+		if err := writeLines(restart, dryPrefix+"-restart-list"); err != nil {
+			return err
+		}
+		if err := writeLines(reload, dryPrefix+"-reload-list"); err != nil {
+			return err
+		}
 	}
 
 	// Do not output changes if not requested
@@ -822,7 +1143,8 @@ func handleModifications(isDry bool, logcfg loggingConfig, symlinkPath string, s
 		return nil
 	}
 
-	// Find removed secrets
+	// Find removed secrets/templates.
+	symlinkRenderedPath := filepath.Join(symlinkPath, RenderedSubdir)
 	err := symlinkWalk(symlinkPath, symlinkPath, func(path string, info os.FileInfo, err error) error {
 		if err != nil {
 			return err
@@ -830,42 +1152,67 @@ func handleModifications(isDry bool, logcfg loggingConfig, symlinkPath string, s
 		if info.IsDir() {
 			return nil
 		}
-		path = strings.TrimPrefix(path, symlinkPath+string(os.PathSeparator))
-		for _, secret := range secrets {
-			if secret.Name == path {
-				return nil
-			}
+
+		// If the path we're looking at isn't in `symlinkRenderedPath`, then
+		// it's a secret.
+		rel, err := filepath.Rel(symlinkRenderedPath, path)
+		if err != nil {
+			return err
 		}
-		removedSecrets[path] = true
+		isSecret := strings.HasPrefix(rel, "..")
+
+		if isSecret {
+			path = strings.TrimPrefix(path, symlinkPath+string(os.PathSeparator))
+			for _, secret := range secrets {
+				if secret.Name == path {
+					return nil
+				}
+			}
+			removedSecrets[path] = true
+		} else {
+			path = strings.TrimPrefix(path, symlinkRenderedPath+string(os.PathSeparator))
+			for _, template := range templates {
+				if template.Name == path {
+					return nil
+				}
+			}
+			removedTemplates[path] = true
+		}
 		return nil
 	})
 	if err != nil {
 		return err
 	}
 
-	// Output new/modified/removed secrets
-	outputChanged := func(changed map[string]bool, regularPrefix, dryPrefix string) {
+	// Output new/modified/removed secrets/templates
+	outputChanged := func(noun string, changed map[string]bool, regularPrefix, dryPrefix string) {
 		if len(changed) > 0 {
 			s := ""
 			if len(changed) != 1 {
 				s = "s"
 			}
 			if isDry {
-				fmt.Printf("%s secret%s: ", dryPrefix, s)
+				fmt.Printf("%s %s%s: ", dryPrefix, noun, s)
 			} else {
-				fmt.Printf("%s secret%s: ", regularPrefix, s)
+				fmt.Printf("%s %s%s: ", regularPrefix, noun, s)
 			}
-			comma := ""
-			for name := range changed {
-				fmt.Printf("%s%s", comma, name)
-				comma = ", "
+
+			// Sort the output for deterministic behavior.
+			keys := make([]string, 0, len(changed))
+			for key := range changed {
+				keys = append(keys, key)
 			}
-			fmt.Println()
+			sort.Strings(keys)
+
+			fmt.Println(strings.Join(keys, ", "))
 		}
 	}
-	outputChanged(newSecrets, "adding", "would add")
-	outputChanged(modifiedSecrets, "modifying", "would modify")
-	outputChanged(removedSecrets, "removing", "would remove")
+	outputChanged("secret", newSecrets, "adding", "would add")
+	outputChanged("secret", modifiedSecrets, "modifying", "would modify")
+	outputChanged("secret", removedSecrets, "removing", "would remove")
+	outputChanged("rendered secret", newTemplates, "adding", "would add")
+	outputChanged("rendered secret", modifiedTemplates, "modifying", "would modify")
+	outputChanged("rendered secret", removedTemplates, "removing", "would remove")
 
 	return nil
 }
@@ -875,8 +1222,8 @@ type keyring struct {
 }
 
 func (k *keyring) Remove() {
-	os.RemoveAll(k.path)
-	os.Unsetenv("GNUPGHOME")
+	_ = os.RemoveAll(k.path)
+	_ = os.Unsetenv("GNUPGHOME")
 }
 
 func setupGPGKeyring(logcfg loggingConfig, sshKeys []string, parentDir string) (*keyring, error) {
@@ -887,10 +1234,10 @@ func setupGPGKeyring(logcfg loggingConfig, sshKeys []string, parentDir string) (
 	k := keyring{dir}
 
 	if err := importSSHKeys(logcfg, sshKeys, dir); err != nil {
-		os.RemoveAll(dir)
+		err = os.RemoveAll(dir)
 		return nil, err
 	}
-	os.Setenv("GNUPGHOME", dir)
+	_ = os.Setenv("GNUPGHOME", dir)
 
 	return &k, nil
 }
@@ -899,7 +1246,10 @@ func parseFlags(args []string) (*options, error) {
 	var opts options
 	fs := flag.NewFlagSet(args[0], flag.ContinueOnError)
 	fs.Usage = func() {
-		fmt.Fprintf(flag.CommandLine.Output(), "Usage: %s [OPTION] manifest.json\n", args[0])
+		_, err := fmt.Fprintf(flag.CommandLine.Output(), "Usage: %s [OPTION] manifest.json\n", args[0])
+		if err != nil {
+			return
+		}
 		fs.PrintDefaults()
 	}
 	var checkMode string
@@ -937,6 +1287,64 @@ func replaceRuntimeDir(path, rundir string) (ret string) {
 	return
 }
 
+func writeTemplate(targetDir string, template template, keysGID int, userMode bool) error {
+	templatePath := filepath.Join(targetDir, template.Name)
+
+	if err := createParentDirs(targetDir, template.Name, keysGID, userMode); err != nil {
+		return err
+	}
+
+	dir := filepath.Dir(templatePath)
+	tempFile, err := os.CreateTemp(dir, "sops-*")
+	tempfileRemoved := false
+	if err != nil {
+		return fmt.Errorf("cannot create temporary file in directory %s: %w", dir, err)
+	}
+	defer func() {
+		_ = tempFile.Close() // noop if already closed
+
+		if !tempfileRemoved {
+			if err := os.Remove(tempFile.Name()); err != nil {
+				fmt.Fprintf(os.Stderr, "failed to remove temporary file %s: %s\n", tempFile.Name(),
+					err)
+			}
+		}
+	}()
+
+	if _, err := tempFile.Write(template.value); err != nil {
+		return fmt.Errorf("cannot write to temporary file %s: %w", tempFile.Name(), err)
+	}
+
+	if err := tempFile.Chmod(template.mode); err != nil {
+		return fmt.Errorf("cannot change mode of temporary file %s to %o: %w", tempFile.Name(), template.mode, err)
+	}
+
+	if !userMode {
+		if err := tempFile.Chown(template.owner, template.group); err != nil {
+			return fmt.Errorf("cannot change owner/group of '%s' to %d/%d: %w", templatePath, template.owner, template.group, err)
+		}
+	}
+
+	if err := tempFile.Close(); err != nil {
+		return fmt.Errorf("cannot close temporary file %s: %w", tempFile.Name(), err)
+	}
+
+	if err := os.Rename(tempFile.Name(), templatePath); err != nil {
+		return fmt.Errorf("cannot rename temporary file %s to %s: %w", tempFile.Name(), templatePath, err)
+	}
+	tempfileRemoved = true
+	return nil
+}
+
+func writeTemplates(targetDir string, templates []template, keysGID int, userMode bool) error {
+	for _, template := range templates {
+		if err := writeTemplate(targetDir, template, keysGID, userMode); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 func installSecrets(args []string) error {
 	opts, err := parseFlags(args)
 	if err != nil {
@@ -962,13 +1370,20 @@ func installSecrets(args []string) error {
 			newSecrets = append(newSecrets, secret)
 		}
 		manifest.Secrets = newSecrets
+		var newTemplates []template
+		for _, template := range manifest.Templates {
+			template.Path = replaceRuntimeDir(template.Path, rundir)
+			newTemplates = append(newTemplates, template)
+		}
+		manifest.Templates = newTemplates
 	}
 
 	app := appContext{
-		manifest:     *manifest,
-		checkMode:    opts.checkMode,
-		ignorePasswd: opts.ignorePasswd,
-		secretFiles:  make(map[string]secretFile),
+		manifest:            *manifest,
+		checkMode:           opts.checkMode,
+		ignorePasswd:        opts.ignorePasswd,
+		secretFiles:         make(map[string]secretFile),
+		secretByPlaceholder: make(map[string]*secret),
 	}
 
 	if err = app.validateManifest(); err != nil {
@@ -1003,28 +1418,37 @@ func installSecrets(args []string) error {
 		}
 		defer keyring.Remove()
 	} else if manifest.GnupgHome != "" {
-		os.Setenv("GNUPGHOME", manifest.GnupgHome)
+		err = os.Setenv("GNUPGHOME", manifest.GnupgHome)
+		if err != nil {
+			return err
+		}
 	}
 
 	// Import age keys
-	if len(manifest.AgeSSHKeyPaths) != 0 || manifest.AgeKeyFile != "" {
+	if (len(manifest.AgeSSHKeyPaths) != 0 || manifest.AgeKeyFile != "") && manifest.AgeSSHKeyFile == "" && manifest.AgeSSHKeyCmd == "" {
 		keyfile := filepath.Join(manifest.SecretsMountPoint, "age-keys.txt")
-		os.Setenv("SOPS_AGE_KEY_FILE", keyfile)
+		err = os.Setenv("SOPS_AGE_KEY_FILE", keyfile)
+		if err != nil {
+			return err
+		}
+
 		// Create the keyfile
 		var ageFile *os.File
 		ageFile, err = os.OpenFile(keyfile, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o600)
 		if err != nil {
 			return fmt.Errorf("cannot create '%s': %w", keyfile, err)
 		}
-		defer ageFile.Close()
-		fmt.Fprintf(ageFile, "# generated by sops-nix at %s\n", time.Now().Format(time.RFC3339))
+		defer func() {
+			_ = ageFile.Close()
+		}()
+		_, err = fmt.Fprintf(ageFile, "# generated by sops-nix at %s\n", time.Now().Format(time.RFC3339))
+		if err != nil {
+			return err
+		}
 
 		// Import SSH keys
 		if len(manifest.AgeSSHKeyPaths) != 0 {
-			err = importAgeSSHKeys(manifest.Logging, manifest.AgeSSHKeyPaths, *ageFile)
-			if err != nil {
-				return err
-			}
+			importAgeSSHKeys(manifest.Logging, manifest.AgeSSHKeyPaths, *ageFile)
 		}
 		// Import the keyfile
 		if manifest.AgeKeyFile != "" {
@@ -1042,9 +1466,26 @@ func installSecrets(args []string) error {
 		}
 	}
 
-	if err = decryptSecrets(manifest.Secrets); err != nil {
+	if manifest.AgeSSHKeyFile != "" {
+		err = os.Setenv("SOPS_AGE_SSH_PRIVATE_KEY_FILE", manifest.AgeSSHKeyFile)
+		if err != nil {
+			return err
+		}
+	}
+
+	if manifest.AgeSSHKeyCmd != "" {
+		err = os.Setenv("SOPS_AGE_SSH_PRIVATE_KEY_CMD", manifest.AgeSSHKeyCmd)
+		if err != nil {
+			return err
+		}
+	}
+
+	if err := decryptSecrets(manifest.Secrets); err != nil {
 		return err
 	}
+
+	// Now that the secrets are decrypted, we can render the templates.
+	renderTemplates(manifest.Templates, app.secretByPlaceholder)
 
 	secretDir, err := prepareSecretsDir(manifest.SecretsMountPoint, manifest.SymlinkPath, keysGID, manifest.UserMode)
 	if err != nil {
@@ -1053,8 +1494,13 @@ func installSecrets(args []string) error {
 	if err := writeSecrets(*secretDir, manifest.Secrets, keysGID, manifest.UserMode); err != nil {
 		return fmt.Errorf("cannot write secrets: %w", err)
 	}
+
+	if err := writeTemplates(path.Join(*secretDir, RenderedSubdir), manifest.Templates, keysGID, manifest.UserMode); err != nil {
+		return fmt.Errorf("cannot render templates: %w", err)
+	}
+
 	if !manifest.UserMode {
-		if err := handleModifications(isDry, manifest.Logging, manifest.SymlinkPath, *secretDir, manifest.Secrets); err != nil {
+		if err := handleModifications(isDry, manifest.Logging, manifest.SymlinkPath, *secretDir, manifest.Secrets, manifest.Templates); err != nil {
 			return fmt.Errorf("cannot request units to restart: %w", err)
 		}
 	}
@@ -1062,11 +1508,11 @@ func installSecrets(args []string) error {
 	if isDry {
 		return nil
 	}
-	if err := symlinkSecrets(manifest.SymlinkPath, manifest.Secrets, manifest.UserMode); err != nil {
-		return fmt.Errorf("failed to prepare symlinks to secret store: %w", err)
-	}
 	if err := atomicSymlink(*secretDir, manifest.SymlinkPath); err != nil {
 		return fmt.Errorf("cannot update secrets symlink: %w", err)
+	}
+	if err := symlinkSecretsAndTemplates(manifest.SymlinkPath, manifest.Secrets, manifest.Templates, manifest.UserMode); err != nil {
+		return fmt.Errorf("failed to prepare symlinks to secret store: %w", err)
 	}
 	if err := pruneGenerations(manifest.SecretsMountPoint, *secretDir, manifest.KeepGenerations); err != nil {
 		return fmt.Errorf("cannot prune old secrets generations: %w", err)

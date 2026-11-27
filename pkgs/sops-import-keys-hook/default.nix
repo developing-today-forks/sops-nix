@@ -1,13 +1,16 @@
-{ makeSetupHook, gnupg, sops, lib }:
+{
+  makeSetupHook,
+  gnupg,
+  sops,
+}:
 
-let
-  # FIXME: drop after 23.05
-  propagatedBuildInputs = if (lib.versionOlder (lib.versions.majorMinor lib.version) "23.05") then "deps" else "propagatedBuildInputs";
-in
-(makeSetupHook {
+makeSetupHook {
   name = "sops-import-keys-hook";
   substitutions = {
     gpg = "${gnupg}/bin/gpg";
   };
-  ${propagatedBuildInputs} = [ sops gnupg ];
-} ./sops-import-keys-hook.bash)
+  propagatedBuildInputs = [
+    sops
+    gnupg
+  ];
+} ./sops-import-keys-hook.bash

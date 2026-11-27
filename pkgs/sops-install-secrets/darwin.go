@@ -1,17 +1,13 @@
 //go:build darwin
-// +build darwin
 
 package main
 
 import (
 	"errors"
 	"fmt"
-	"log"
 	"os"
 	"os/exec"
 	"strings"
-
-	"golang.org/x/sys/unix"
 )
 
 func RuntimeDir() (string, error) {
@@ -22,29 +18,6 @@ func RuntimeDir() (string, error) {
 		return "", fmt.Errorf("cannot get DARWIN_USER_TEMP_DIR: %v", err)
 	}
 	return strings.TrimSuffix(rundir, "/"), nil
-}
-
-func SecureSymlinkChown(symlinkToCheck string, expectedTarget string, owner, group int) error {
-	// not sure what O_PATH is needed for anyways
-	fd, err := unix.Open(symlinkToCheck, unix.O_CLOEXEC|unix.O_SYMLINK|unix.O_NOFOLLOW, 0)
-	if err != nil {
-		return fmt.Errorf("failed to open %s: %w", symlinkToCheck, err)
-	}
-	defer unix.Close(fd)
-
-	buf := make([]byte, len(expectedTarget)+1) // oversize by one to detect trunc
-	n, err := unix.Readlinkat(fd, "", buf)
-	if err != nil {
-		return fmt.Errorf("couldn't readlinkat %s", symlinkToCheck)
-	}
-	if n > len(expectedTarget) || string(buf[:n]) != expectedTarget {
-		return fmt.Errorf("symlink %s does not point to %s", symlinkToCheck, expectedTarget)
-	}
-	err = unix.Fchownat(fd, "", owner, group, unix.AT_SYMLINK_NOFOLLOW)
-	if err != nil {
-		return fmt.Errorf("cannot change owner of '%s' to %d/%d: %w", symlinkToCheck, owner, group, err)
-	}
-	return nil
 }
 
 // Does:
@@ -71,21 +44,25 @@ func MountSecretFs(mountpoint string, keysGID int, _useTmpfs bool, userMode bool
 	size := mb * 1024 * 1024 / 512 // size in sectors a 512 bytes
 	cmd := exec.Command("hdiutil", "attach", "-nomount", fmt.Sprintf("ram://%d", int(size)))
 	out, err := cmd.Output() // /dev/diskN
-	log.Printf("%q\n", string(out))
+	if err != nil {
+		return fmt.Errorf("cannot execute hdiutil: %w", err)
+	}
 	diskpath := strings.TrimRight(string(out[:]), " \t\n")
-	log.Printf("%q\n", diskpath)
-	log.Printf("hdiutil attach ret %v. out: %s", err, diskpath)
 
 	// format as hfs
-	out, err = exec.Command("newfs_hfs", "-s", diskpath).Output()
-	log.Printf("newfs_hfs ret %v. out: %s", err, out)
+	_, err = exec.Command("newfs_hfs", "-s", diskpath).Output()
+	if err != nil {
+		return fmt.Errorf("cannot create hfs filesystem at '%s': %w", diskpath, err)
+	}
 
 	// "posix" mount takes `struct hfs_mount_args` which we dont have bindings for at hand.
 	// See https://stackoverflow.com/a/49048846/4108673
 	// err = unix.Mount("hfs", mountpoint, unix.MNT_NOEXEC|unix.MNT_NODEV, mount_args)
 	// Instead we call:
-	out, err = exec.Command("mount", "-t", "hfs", "-o", "nobrowse,nodev,nosuid,-m=0751", diskpath, mountpoint).Output()
-	log.Printf("mount ret %v. out: %s", err, out)
+	_, err = exec.Command("mount", "-t", "hfs", "-o", "nobrowse,nodev,nosuid,-m=0751", diskpath, mountpoint).Output()
+	if err != nil {
+		return fmt.Errorf("cannot mount '%s' to '%s': %w", diskpath, mountpoint, err)
+	}
 
 	// There is no documented way to check for memfs mountpoint. Thus we place a file.
 	path := mountpoint + "/sops-nix-secretfs"
