@@ -61,8 +61,7 @@ If you use experimental nix flakes support:
 ``` nix
 {
   inputs.sops-nix.url = "github:Mic92/sops-nix";
-  # optional, not necessary for the module
-  #inputs.sops-nix.inputs.nixpkgs.follows = "nixpkgs";
+  inputs.sops-nix.inputs.nixpkgs.follows = "nixpkgs";
 
   outputs = { self, nixpkgs, sops-nix }: {
     # change `yourhostname` to your actual hostname
@@ -72,6 +71,29 @@ If you use experimental nix flakes support:
       modules = [
         ./configuration.nix
         sops-nix.nixosModules.sops
+      ];
+    };
+  };
+}
+```
+
+##### [`nix-darwin`](https://github.com/nix-darwin/nix-darwin)
+
+A module for `nix-darwin` is also available for global install with flakes:
+
+```nix
+{
+  inputs.nixpkgs.url = "github:NixOS/nixpkgs/nixpkgs-unstable";
+  inputs.nix-darwin.url = "github:nix-darwin/nix-darwin/master";
+  inputs.nix-darwin.inputs.nixpkgs.follows = "nixpkgs";
+  inputs.sops-nix.url = "github:Mic92/sops-nix";
+  #inputs.sops-nix.inputs.nixpkgs.follows = "nixpkgs";
+
+  outputs = { self, nix-darwin, nixpkgs, sops-nix }: {
+    darwinConfigurations.yourhostname = nix-darwin.lib.darwinSystem {
+      modules = [
+        ./configuration.nix
+        sops-nix.darwinModules.sops
       ];
     };
   };
@@ -155,6 +177,8 @@ $ nix-shell -p gnupg -p ssh-to-pgp --run "ssh-to-pgp -private-key -i /tmp/id_rsa
 $ rm /tmp/id_rsa
 ```
 
+When using `nix-darwin` save the `age` key to `$HOME/Library/Application Support/sops/age/keys.txt` or set a [custom](https://github.com/getsops/sops#23encrypting-using-age) configuration directory.
+
 <details>
 <summary> How to find the public key of an `age` key </summary>
 
@@ -193,7 +217,7 @@ Your `age` public key or GPG fingerprint can be written to your [`.sops.yaml`](h
 ```yaml
 # This example uses YAML anchors which allows reuse of multiple keys 
 # without having to repeat yourself.
-# Also see https://github.com/Mic92/dotfiles/blob/master/nixos/.sops.yaml
+# Also see https://github.com/Mic92/dotfiles/blob/d6114726d859df36ccaa32891c4963ae5717ef7f/nixos/.sops.yaml
 # for a more complex example.
 keys:
   - &admin_alice 2504791468b153b8a3963cc97ba53d1919c5dfd4
@@ -408,7 +432,6 @@ If you derived your server public key from SSH, all you need in your `configurat
 
 ```nix
 {
-  imports = [ <sops-nix/modules/sops> ];
   # This will add secrets.yml to the nix store
   # You can avoid this by adding a string to the full path instead, i.e.
   # sops.defaultSopsFile = "/root/.sops/secrets/example.yaml";
@@ -571,9 +594,18 @@ $y$j9T$WFoiErKnEnMcGq0ruQK4K.$4nJAY3LBeBsZBTYSkdTOejKU6KlDmhnfUV3Ll1K/1b.
 }
 ```
 
-**Note:** If you are using Impermanence, you must set `sops.age.keyFile` to a keyfile inside your persist directory or it will not exist at boot time. 
-For example: `/nix/persist/var/lib/sops-nix/key.txt`
-Similarly if ssh host keys are used instead, they also need to be placed inside the persisted storage.
+**Note:** If you are using Impermanence, the key used for secret decryption (`sops.age.keyFile`, or the host SSH keys) must be in a persisted directory,
+loaded early enough during boot. For example:
+
+```nix
+sops.age.keyFile = "/nix/persist/var/lib/sops-nix/key.txt";
+```
+
+or:
+
+```nix
+fileSystems."/etc/ssh".neededForBoot = true;
+```
 
 ## Different file formats
 
@@ -707,12 +739,50 @@ This is how it can be included in your `configuration.nix`:
 }
 ```
 
+## Emit plain file for yaml and json formats
+
+By default, sops-nix extracts a single key from yaml and json files. If you
+need the plain file instead of extracting a specific key from the input document,
+you can set `key` to an empty string.
+
+For example, the input document `my-config.yaml` likes this:
+
+```yaml
+my-secret1: ENC[AES256_GCM,data:tkyQPQODC3g=,iv:yHliT2FJ74EtnLIeeQtGbOoqVZnF0q5HiXYMJxYx6HE=,tag:EW5LV4kG4lcENaN2HIFiow==,type:str]
+my-secret2: ENC[AES256_GCM,data:tkyQPQODC3g=,iv:yHliT2FJ74EtnLIeeQtGbOoqVZnF0q5HiXYMJxYx6HE=,tag:EW5LV4kG4lcENaN2HIFiow==,type:str]
+sops:
+    kms: []
+    gcp_kms: []
+    azure_kv: []
+    hc_vault: []
+...
+```
+
+This is how it can be included in your NixOS module:
+
+```nix
+{
+  sops.secrets.my-config = {
+    format = "yaml";
+    sopsFile = ./my-config.yaml;
+    key = "";
+  };
+}
+```
+
+Then, it will be mounted as `/run/secrets/my-config`:
+
+```yaml
+my-secret1: hello
+my-secret2: hello
+```
+
 ## Use with home manager
 
 sops-nix also provides a home-manager module.
 This module provides a subset of features provided by the system-wide sops-nix since features like the creation of the ramfs and changing the owner of the secrets are not available for non-root users.
 
-Instead of running as an activation script, sops-nix runs as a systemd user service called `sops-nix.service`.
+The home-manager module requires systemd/user as it runs a service called `sops-nix.service` rather than an activation script.
 While the sops-nix _system_ module decrypts secrets to the system non-persistent `/run/secrets`, the _home-manager_ module places them in the users non-persistent `$XDG_RUNTIME_DIR/secrets.d`.
 Additionally secrets are symlinked to the users home at `$HOME/.config/sops-nix/secrets` which are referenced for the `.path` value in sops-nix.
 This requires that the home-manager option `home.homeDirectory` is set to determine the home-directory on evaluation.  It will have to be manually set if home-manager is configured as stand-alone or on non NixOS systems.
@@ -782,6 +852,31 @@ The secrets are decrypted in a systemd user service called `sops-nix`, so other 
 ```nix
 {
   systemd.user.services.mbsync.Unit.After = [ "sops-nix.service" ];
+}
+```
+
+### Qubes Split GPG support
+
+If you are using Qubes with the [Split GPG](https://www.qubes-os.org/doc/split-gpg),
+then you can configure sops to utilize the `qubes-gpg-client-wrapper` with the `sops.gnupg.qubes-split-gpg` options.
+The example above updated looks like this:
+```nix
+{
+  sops = {
+    gnupg.qubes-split-gpg = {
+      enable = true;
+      domain = "vault-gpg";
+    };
+    defaultSopsFile = ./secrets.yaml;
+    secrets.test = {
+      # sopsFile = ./secrets.yml.enc; # optionally define per-secret files
+
+      # %r gets replaced with a runtime directory, use %% to specify a '%'
+      # sign. Runtime dir is $XDG_RUNTIME_DIR on linux and $(getconf
+      # DARWIN_USER_TEMP_DIR) on darwin.
+      path = "%r/test.txt";
+    };
+  };
 }
 ```
 

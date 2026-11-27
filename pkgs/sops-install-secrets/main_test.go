@@ -1,5 +1,4 @@
 //go:build linux || darwin
-// +build linux darwin
 
 package main
 
@@ -42,7 +41,7 @@ func writeManifest(t *testing.T, dir string, m *manifest) string {
 	ok(t, err)
 	encoder := json.NewEncoder(f)
 	ok(t, encoder.Encode(m))
-	f.Close()
+	_ = f.Close()
 	return filename
 }
 
@@ -60,7 +59,7 @@ type testDir struct {
 }
 
 func (dir testDir) Remove() {
-	os.RemoveAll(dir.path)
+	_ = os.RemoveAll(dir.path)
 }
 
 func newTestDir(t *testing.T) testDir {
@@ -98,12 +97,14 @@ func testGPG(t *testing.T) {
 		}
 	}()
 
+	nobody := "nobody"
+	nogroup := "nogroup"
 	// should create a symlink
 	yamlSecret := secret{
 		Name:         "test",
 		Key:          "test_key",
-		Owner:        "nobody",
-		Group:        "nogroup",
+		Owner:        &nobody,
+		Group:        &nogroup,
 		SopsFile:     path.Join(assets, "secrets.yaml"),
 		Path:         path.Join(testdir.path, "test-target"),
 		Mode:         "0400",
@@ -112,12 +113,13 @@ func testGPG(t *testing.T) {
 	}
 
 	var jsonSecret, binarySecret, dotenvSecret, iniSecret secret
+	root := "root"
 	// should not create a symlink
 	jsonSecret = yamlSecret
 	jsonSecret.Name = "test2"
-	jsonSecret.Owner = "root"
+	jsonSecret.Owner = &root
 	jsonSecret.Format = "json"
-	jsonSecret.Group = "root"
+	jsonSecret.Group = &root
 	jsonSecret.SopsFile = path.Join(assets, "secrets.json")
 	jsonSecret.Path = path.Join(testdir.secretsPath, "test2")
 	jsonSecret.Mode = "0700"
@@ -130,16 +132,16 @@ func testGPG(t *testing.T) {
 
 	dotenvSecret = yamlSecret
 	dotenvSecret.Name = "test4"
-	dotenvSecret.Owner = "root"
-	dotenvSecret.Group = "root"
+	dotenvSecret.Owner = &root
+	dotenvSecret.Group = &root
 	dotenvSecret.Format = "dotenv"
 	dotenvSecret.SopsFile = path.Join(assets, "secrets.env")
 	dotenvSecret.Path = path.Join(testdir.secretsPath, "test4")
 
 	iniSecret = yamlSecret
 	iniSecret.Name = "test5"
-	iniSecret.Owner = "root"
-	iniSecret.Group = "root"
+	iniSecret.Owner = &root
+	iniSecret.Group = &root
 	iniSecret.Format = "ini"
 	iniSecret.SopsFile = path.Join(assets, "secrets.ini")
 	iniSecret.Path = path.Join(testdir.secretsPath, "test5")
@@ -212,13 +214,15 @@ func testSSHKey(t *testing.T) {
 	target := path.Join(testdir.path, "existing-target")
 	file, err := os.Create(target)
 	ok(t, err)
-	file.Close()
+	_ = file.Close()
 
+	nobody := "nobody"
+	nogroup := "nogroup"
 	s := secret{
 		Name:         "test",
 		Key:          "test_key",
-		Owner:        "nobody",
-		Group:        "nogroup",
+		Owner:        &nobody,
+		Group:        &nogroup,
 		SopsFile:     path.Join(assets, "secrets.yaml"),
 		Path:         target,
 		Mode:         "0400",
@@ -245,13 +249,15 @@ func TestAge(t *testing.T) {
 	target := path.Join(testdir.path, "existing-target")
 	file, err := os.Create(target)
 	ok(t, err)
-	file.Close()
+	_ = file.Close()
 
+	nobody := "nobody"
+	nogroup := "nogroup"
 	s := secret{
 		Name:         "test",
 		Key:          "test_key",
-		Owner:        "nobody",
-		Group:        "nogroup",
+		Owner:        &nobody,
+		Group:        &nogroup,
 		SopsFile:     path.Join(assets, "secrets.yaml"),
 		Path:         target,
 		Mode:         "0400",
@@ -278,13 +284,15 @@ func TestAgeWithSSH(t *testing.T) {
 	target := path.Join(testdir.path, "existing-target")
 	file, err := os.Create(target)
 	ok(t, err)
-	file.Close()
+	_ = file.Close()
 
+	nobody := "nobody"
+	nogroup := "nogroup"
 	s := secret{
 		Name:         "test",
 		Key:          "test_key",
-		Owner:        "nobody",
-		Group:        "nogroup",
+		Owner:        &nobody,
+		Group:        &nogroup,
 		SopsFile:     path.Join(assets, "secrets.yaml"),
 		Path:         target,
 		Mode:         "0400",
@@ -302,6 +310,76 @@ func TestAgeWithSSH(t *testing.T) {
 	testInstallSecret(t, testdir, &m)
 }
 
+func TestAgeWithSSHKeyFile(t *testing.T) {
+	assets := testAssetPath()
+
+	testdir := newTestDir(t)
+	defer testdir.Remove()
+
+	target := path.Join(testdir.path, "existing-target")
+	file, err := os.Create(target)
+	ok(t, err)
+	_ = file.Close()
+
+	nobody := "nobody"
+	nogroup := "nogroup"
+	s := secret{
+		Name:         "test",
+		Key:          "test_key",
+		Owner:        &nobody,
+		Group:        &nogroup,
+		SopsFile:     path.Join(assets, "secrets-native-ssh.yaml"),
+		Path:         target,
+		Mode:         "0400",
+		RestartUnits: []string{"affected-service"},
+		ReloadUnits:  []string{"affected-reload-service"},
+	}
+
+	m := manifest{
+		Secrets:           []secret{s},
+		SecretsMountPoint: testdir.secretsPath,
+		SymlinkPath:       testdir.symlinkPath,
+		AgeSSHKeyFile:     path.Join(assets, "ssh-ed25519-key"),
+	}
+
+	testInstallSecret(t, testdir, &m)
+}
+
+func TestAgeWithSSHKeyCmd(t *testing.T) {
+	assets := testAssetPath()
+
+	testdir := newTestDir(t)
+	defer testdir.Remove()
+
+	target := path.Join(testdir.path, "existing-target")
+	file, err := os.Create(target)
+	ok(t, err)
+	_ = file.Close()
+
+	nobody := "nobody"
+	nogroup := "nogroup"
+	s := secret{
+		Name:         "test",
+		Key:          "test_key",
+		Owner:        &nobody,
+		Group:        &nogroup,
+		SopsFile:     path.Join(assets, "secrets-native-ssh.yaml"),
+		Path:         target,
+		Mode:         "0400",
+		RestartUnits: []string{"affected-service"},
+		ReloadUnits:  []string{"affected-reload-service"},
+	}
+
+	m := manifest{
+		Secrets:           []secret{s},
+		SecretsMountPoint: testdir.secretsPath,
+		SymlinkPath:       testdir.symlinkPath,
+		AgeSSHKeyCmd:      fmt.Sprintf("cat %s", path.Join(assets, "ssh-ed25519-key")),
+	}
+
+	testInstallSecret(t, testdir, &m)
+}
+
 func TestAll(t *testing.T) {
 	// we can't test in parallel because we rely on GNUPGHOME environment variable
 	testGPG(t)
@@ -314,11 +392,13 @@ func TestValidateManifest(t *testing.T) {
 	testdir := newTestDir(t)
 	defer testdir.Remove()
 
+	nobody := "nobody"
+	nogroup := "nogroup"
 	s := secret{
 		Name:         "test",
 		Key:          "test_key",
-		Owner:        "nobody",
-		Group:        "nogroup",
+		Owner:        &nobody,
+		Group:        &nogroup,
 		SopsFile:     path.Join(assets, "secrets.yaml"),
 		Path:         path.Join(testdir.path, "test-target"),
 		Mode:         "0400",
